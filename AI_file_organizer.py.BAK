@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+import		os, sys, json, argparse, shutil
+		from pathlib import Path
+		from typing import List, Dict, Any
+		import numpy as np
+		from dotenv import load_dotenv
+		from tqdm import tqdm
+		import faiss
+		from sentence_transformers import SentenceTransformer
+		import requests
+		import warnings warnings.
+filterwarnings("ignore", category = UserWarning)
+
+#---------- Optional parsers / OCR (loaded lazily so the script still runs without them) ----------
+def import_optional():
+mods =
+{
+}
+try:
+from pdfminer.high_level import extract_text as pdf_extract_text
+mods["pdf_extract_text"] = pdf_extract_text
+except Exception:
+mods["pdf_extract_text"] = None
+try:
+import docx2txt
+mods["docx2txt"] = docx2txt
+except Exception:
+mods["docx2txt"] = None
+try:
+import pandas as pd
+mods["pd"] = pd
+except Exception:
+mods["pd"] = None
+try:
+from pptx import Presentation
+mods["Presentation"] = Presentation
+except Exception:
+mods["Presentation"] = None
+try:
+import pytesseract
+from PIL import Image
+mods["pytesseract"] = pytesseract
+mods["PIL_Image"] = Image
+except Exception:
+mods["pytesseract"] = None
+mods["PIL_Image"] = None
+return mods
+
+MODS = import_optional()
+
+#---------- Env / config ----------
+def read_env():
+load_dotenv()
+base = Path(os.getenv("BASE_FOLDER", "./mock_network_drive")).resolve()
+index_dir = Path(os.getenv("INDEX_DIR", "./index_store")).resolve()
+embed_model = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+ollama_model = os.getenv("OLLAMA_MODEL", "llama3:8b")
+ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+index_dir.mkdir(parents = True, exist_ok = True)
+return base, index_dir, embed_model, ollama_host, ollama_model
+
+#---------- Text chunking ----------
+def chunk_text(text:str, chunk_size:int = 1500, overlap:int = 200)->List[str]:
+chunks =[]
+i = 0
+n = len(text)
+while i
+<n:
+	j = min(i + chunk_size, n)
+chunks.append(text[i:j])
+		i = j - overlap
+		if i
+<0:
+		i = 0
+			if i
+	>=n:
+			break
+				return chunks
+
+#---------- Extraction ----------
+	def extract_text_from_file(path:Path)->str:
+			suf = path.suffix.lower()
+	try:
+			if suf
+		== ".pdf" and MODS["pdf_extract_text"]:
+				txt = MODS["pdf_extract_text"] (str(path)) or ""
+					if txt
+			.strip():
+					return txt
+#OCR fallback recommended via poppler + tesseract pipeline (omitted here for simplicity)
+						return ""
+			elif suf == ".docx" and MODS["docx2txt"]:
+					return MODS["docx2txt"].process(str(path)) or ""
+			elif suf in[".xlsx", ".xls"] and MODS["pd"]:
+					dfs = MODS["pd"].read_excel(path, sheet_name = None)
+						return "\n\n".join([df.to_string() for _, df in dfs.items()])
+				elif suf == ".pptx" and MODS["Presentation"]:
+						prs = MODS["Presentation"] (str(path))
+							texts =[]
+							for slide
+					in prs.slides:
+							for shape
+						in slide.shapes:
+								if hasattr
+							(shape, "text") and shape.text:
+									texts.append(shape.text)
+										return "\n".join(texts)
+							elif suf in[".png", ".jpg", ".jpeg", ".tiff", ".tif"] and MODS["pytesseract"] and MODS["PIL_Image"]:
+									return MODS["pytesseract"].image_to_string(MODS["PIL_Image"].open(path))
+							elif suf in[".txt", ".csv", ".json", ".md"]:
+							try:
+									return path.read_text(encoding = "utf-8", errors = "ignore")
+							except Exception:
+									return path.read_text(errors = "ignore")
+										else
+							:
+									return ""
+							except Exception:
+									return ""
+
+#---------- Build index ----------
+							def build_index(base:Path, index_dir:Path, embed_model_name:str, max_files:int = None, types:List[str] = None):
+									types =[t.lower() for t in types]
+										if types
+											else
+											None
+												files =[p for p in base.rglob("*") if p.is_file()]
+												if types
+											:
+													files =[p for p in files if p.suffix.lower().lstrip(".") in types]
+														if max_files
+													:
+													files = files[:	max_files]
+
+																model = SentenceTransformer(embed_model_name)
+																dim = model.get_sentence_embedding_dimension()
+																index = faiss.IndexFlatIP(dim)
+
+																meta_path = index_dir / "chunks_meta.jsonl"
+																vec_path = index_dir / "vectors.faiss"
+																map_path = index_dir / "chunk_to_file.json"
+																for p
+														in[meta_path, vec_path, map_path]:
+																if p
+															.exists():
+																	p.unlink()
+
+															chunk_to_file:		Dict[str, str] = {
+																	}
+all_vecs =[]
+total_chunks = 0
+
+for f
+in tqdm(files, desc = "Indexing files"):
+	text = extract_text_from_file(f)
+		if not
+text or not text.strip():
+		continue
+			chunks = chunk_text(text)
+			if not
+	chunks:
+			continue
+
+				vecs = model.encode(chunks, normalize_embeddings = True, convert_to_numpy = True)
+				all_vecs.append(vecs)
+
+	with open(meta_path, "a", encoding = "utf-8") as w:
+			for i
+		,ch in enumerate(chunks):
+				cid = total_chunks + i
+					record = {
+		"chunk_id":	cid,
+		"path":			str(f),
+		"chunk_index":		i,
+		"text_preview":ch[:	500]
+				}
+w.write(json.dumps(record, ensure_ascii = False) + "\n")
+chunk_to_file[str(cid)] = str(f)
+total_chunks += len(chunks)
+
+if total_chunks
+== 0:
+	print("No chunks created. Check BASE_FOLDER and file parsers.")
+		return
+
+		all_vecs_np = np.vstack(all_vecs).astype(np.float32)
+		index.add(all_vecs_np)
+		faiss.write_index(index, str(vec_path))
+		json.dump(chunk_to_file, open(map_path, "w"))
+
+		print(f "Indexed {len(files)} files, {total_chunks} chunks.")
+		print(f "Index saved to {vec_path}")
+		print(f "Metadata saved to {meta_path}")
+
+#---------- Load index ----------
+def load_index(index_dir:Path, embed_model_name:str):
+	vec_path = index_dir / "vectors.faiss"
+		meta_path = index_dir / "chunks_meta.jsonl"
+		if not
+vec_path.exists() or not meta_path.exists():
+		raise FileNotFoundError("Index not found. Run 'build' first.")
+			index = faiss.read_index(str(vec_path))
+			model = SentenceTransformer(embed_model_name)
+			return index, model, meta_path
+
+def iter_meta(meta_path:Path):
+with open(meta_path, "r", encoding = "utf-8") as r:
+		for line
+	in r:
+			yield json.loads(line)
+
+#---------- Search ----------
+	def search(query:str, k:int, index, model, meta_path:Path):
+			qvec = model.encode([query], normalize_embeddings = True, convert_to_numpy = True).astype(np.float32)
+				D, I = index.search(qvec, k)
+				lines = list(iter_meta(meta_path))
+				results =[]
+				for rank
+		,idx in enumerate(I[0]):
+				if idx
+			<0 or idx >= len(lines):
+					continue
+						rec = lines[idx]
+						rec["score"] = float (D[0][rank])
+							results.append(rec)
+							return results
+
+#---------- Ollama helper ----------
+							def ollama_generate(prompt:str, host:str, model:str, stream:bool = False)->str:
+					url = f "{host}/api/generate"
+					data = {"model":model, "prompt":prompt, "stream":stream}
+resp = requests.post(url, json = data, timeout = 120)
+resp.raise_for_status()
+j = resp.json()
+return j.get("response", "")
+
+def build_tagging_prompt(query:str, results:List[Dict[str, Any]])->str:
+context_lines =[]
+for r in results:
+preview = r['text_preview']
+	[:400].replace('\n', ' ')
+context_lines.append(f "- PATH: {r['path']}  SCORE: {r['score']:.3f}\n  PREVIEW: {preview}")
+context = "\n".join(context_lines)
+prompt = f "" "You are a file routing assistant for a medical practice.
+The user will provide an instruction describing how files should be categorized or moved.
+Based on the retrieved snippets, return a JSON array of actions.Each action must be:
+{{
+"path":"<absolute_source_path>", "action":"move|copy|tag", "dest":"<destination folder or tag>", "reason":"<short reason>"
+}
+}
+
+User		instruction:
+{
+	query
+}
+
+Retrieved	context:
+{
+	context
+}
+
+Return		only valid
+JSON(no extra text).
+"" "
+return prompt
+
+#---------- Tagging / routing ----------
+def do_tag(query:str, k:int, index_dir:Path, embed_model:str, ollama_host:str, ollama_model:str, apply:bool = False, dry_run_limit:int = 50):
+index, model, meta_path = load_index(index_dir, embed_model)
+results = search(query, k, index, model, meta_path)
+if not
+results:
+	print("No results found.")
+		return
+
+		prompt = build_tagging_prompt(query, results)
+try:
+	plan_json = ollama_generate(prompt, ollama_host, ollama_model)
+except Exception as e:
+	print(f "Ollama call failed: {e}")
+		return
+
+try:
+	actions = json.loads(plan_json)
+except Exception:
+	print("Model did not return valid JSON. Raw output:")
+		print(plan_json)
+		return
+
+		count = 0
+		for a
+in actions:
+		src = Path(a.get("path", ""))
+			action = a.get("action", "")
+			dest = a.get("dest", "")
+			reason = a.get("reason", "")
+			print(f "[PLAN] {action.upper():5} {src} -> {dest} | {reason}")
+
+			if apply
+	:
+	try:
+			if action
+		== "move":
+				Path(dest).mkdir(parents = True, exist_ok = True)
+					shutil.move(str(src), str(Path(dest) / src.name))
+		elif action == "copy":
+				Path(dest).mkdir(parents = True, exist_ok = True)
+					shutil.copy2(str(src), str(Path(dest) / src.name))
+		elif action == "tag":
+#TODO: implement sidecar metadata DB tagging
+				pass
+		except Exception as e:
+				print(f "  ! Failed to apply: {e}")
+
+					count += 1
+					if not
+			apply and count >= dry_run_limit:
+					print(f "(dry-run limit {dry_run_limit} reached)")
+						break
+
+#---------- CLI ----------
+			def main():
+					base, index_dir, embed_model, ollama_host, ollama_model = read_env()
+
+						ap = argparse.ArgumentParser(description = "Local AI File Organizer")
+						sub = ap.add_subparsers(dest = "cmd")
+
+						sb = sub.add_parser("build", help = "Build FAISS index from BASE_FOLDER")
+						sb.add_argument("--max-files", type = int, default = None)
+						sb.add_argument("--types", type = str, nargs = "*", default = None, help = "Restrict by file extensions, e.g. pdf docx txt")
+
+						sq = sub.add_parser("query", help = "Semantic search")
+						sq.add_argument("--q", type = str, required = True, help = "Query text")
+						sq.add_argument("--k", type = int, default = 5)
+
+						st = sub.add_parser("tag", help = "Suggest routing/tagging via Ollama")
+						st.add_argument("--q", type = str, required = True, help = "Instruction / request")
+						st.add_argument("--k", type = int, default = 8)
+						st.add_argument("--apply", action = "store_true", help = "Apply file operations")
+
+						args = ap.parse_args()
+
+						if args
+.cmd == "build":
+						print(f "BASE_FOLDER={base}")
+							build_index(base, index_dir, embed_model, max_files = args.max_files, types = args.types)
+				elif args.cmd == "query":
+						index, model, meta_path = load_index(index_dir, embed_model)
+							results = search(args.q, args.k, index, model, meta_path)
+							for r
+					in results:
+					prev = r['text_preview'][:240].replace('\n', ' ')
+								print(f "{r['score']:.3f} :: {r['path']} :: {prev}")
+					elif args.cmd == "tag":
+							do_tag(args.q, args.k, index_dir, embed_model, ollama_host, ollama_model, apply = args.apply)
+								else
+					:
+							ap.print_help()
+
+								if __name__
+						== "__main__":

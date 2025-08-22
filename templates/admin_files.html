@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"><title>Admin — Files</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{margin:0}
+    main{padding:16px}
+    .row{display:flex; gap:8px; align-items:center; margin-bottom:10px}
+    input[type=search]{flex:1; padding:10px; border-radius:10px; border:1px solid #2a2f37; background:#0f1116; color:#eaeef2}
+    table{width:100%; border-collapse:collapse}
+    th,td{padding:8px 10px; border-bottom:1px solid #222}
+    pre{white-space:pre-wrap; background:#0f1116; border:1px solid #262a31; padding:12px; border-radius:10px; max-height:50vh; overflow:auto}
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand">NU Local AI — Admin</div>
+  <nav>
+    <a class="link" href="/admin">Users</a>
+    <a class="link" href="/admin/files">Files</a>
+    <form action="/logout" method="post" style="display:inline"><button class="link">Log out</button></form>
+  </nav>
+</header>
+<main>
+  <div class="row">
+    <input id="q" type="search" placeholder="Search filename or text preview…">
+    <button id="reindex">Reindex</button>
+  </div>
+  <table id="tbl">
+    <thead><tr><th>Path</th><th>Type</th><th>Size</th><th>OCR</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <h3>Preview</h3>
+  <pre id="preview">(select a file)</pre>
+</main>
+<script>
+async function load(q=""){
+  const r = await fetch('/api/files?q='+encodeURIComponent(q));
+  const data = await r.json();
+  const tbody = document.querySelector('#tbl tbody');
+  tbody.innerHTML = '';
+  data.files.forEach(f=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><a href="#" data-path="${f.path}">${f.path}</a></td>
+      <td>${f.type||''}</td>
+      <td>${f.size||0}</td>
+      <td>${f.ocr_used? 'yes':'no'}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+document.addEventListener('click', async (e)=>{
+  const a = e.target.closest('a[data-path]');
+  if(!a) return;
+  e.preventDefault();
+  const r = await fetch('/api/file?path='+encodeURIComponent(a.dataset.path));
+  const data = await r.json();
+  document.getElementById('preview').textContent = data.text_preview || '(empty)';
+});
+document.getElementById('q').addEventListener('input', e=>load(e.target.value));
+document.getElementById('reindex').addEventListener('click', async ()=>{
+  const r = await fetch('/admin/reindex', {method:'POST'});
+  const d = await r.json();
+  alert('Updated: '+d.updated);
+  load(document.getElementById('q').value);
+});
+load();
+</script>
+</body>
+</html>

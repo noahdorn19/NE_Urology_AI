@@ -1,0 +1,210 @@
+{
+  "meta": {
+    "source": "Scheduling Decision Tree.xlsx (exported via OCR ingester)",
+    "version": "2025-08-21",
+    "departments": ["billing", "front_desk", "phones", "triage", "global"],
+    "notes": "Rules distilled from workbook sheets + OCR text. Some EMF charts may still need rasterization for OCR."
+  },
+  "provider_map": {
+  "providers": [
+    {"abbr": "DLH", "name": "Dr. Don Henslee", "role": "MD", "aliases": ["Don Henslee", "D. Henslee", "Dr Henslee (father)", "Father Henslee", "Sr", "Senior"]},
+    {"abbr": "BLH", "name": "Dr. Brandon Henslee", "role": "MD", "aliases": ["Brandon Henslee", "B. Henslee", "Dr Henslee (son)", "Son Henslee", "Jr", "Junior"]},
+
+    {"abbr": "AJL", "name": "Dr. Lepinski", "role": "MD", "aliases": ["Lepinski"]},
+    {"abbr": "AJP", "name": "Dr. Pomajzl", "role": "MD", "aliases": ["Pomajzl"]},
+    {"abbr": "JRH", "name": "Dr. Henning", "role": "MD", "aliases": ["Henning"]},
+    {"abbr": "DBW", "name": "Dr. Wiltfong", "role": "MD", "aliases": ["Wiltfong"]},
+    {"abbr": "LAW", "name": "Dr. Wiebusch", "role": "MD", "aliases": ["Wiebusch"]},
+    {"abbr": "TPB", "name": "Dr. Brush", "role": "MD", "aliases": ["Brush"]},
+    {"abbr": "TMK", "name": "Dr. Kirkpatrick", "role": "MD", "aliases": ["Kirkpatrick"]},
+    {"abbr": "LWM", "name": "Dr. McGuffey", "role": "MD", "aliases": ["McGuffey"]},
+
+    {"abbr": "SCM", "name": "Simone Martin", "role": "MSN, APRN", "aliases": ["Simone", "Martin"]},
+    {"abbr": "KMW", "name": "Katherine Wolverton", "role": "DNP, FNP, APRN-NP", "aliases": ["Wolverton", "Katherine", "Kate"]},
+    {"abbr": "CTB", "name": "Casey Bock", "role": "PA-C", "aliases": ["Bock", "Casey"]},
+    {"abbr": "HBS", "name": "Heidi Beynon-Solano", "role": "PA-C", "aliases": ["Beynon-Solano", "Heidi"]},
+    {"abbr": "TAW", "name": "Tiffany Wood", "role": "PA-C, MPAS", "aliases": ["Tiffany", "Wood"]},
+    {"abbr": "JGO", "name": "Jackie O'Doherty", "role": "PA-C", "aliases": ["O'Doherty", "Jackie"]},
+    {"abbr": "JDW", "name": "Julie Wilson", "role": "APRN-NP", "aliases": ["Wilson", "Julie"]},
+    {"abbr": "JLC", "name": "Jacob Creevan", "role": "PA-C", "aliases": ["Creevan", "Jake", "Jacob"]},
+    {"abbr": "LBL", "name": "Lillie Lueke", "role": "DNP, APRN", "aliases": ["Lueke", "Lillie"]},
+    {"abbr": "ADS", "name": "Ashley Sealy", "role": "MSN, FNP-C, RDN, LMNT", "aliases": ["Sealy", "Ashley"]},
+    {"abbr": "AKC", "name": "Amy Collingham", "role": "DNP, APRN, FNP-C", "aliases": ["Collingham", "Amy"]}
+  ],
+
+  "ambiguity_rules": [
+    {
+      "trigger_terms": ["dr. henslee", "dr henslee", "henslee"],
+      "require_disambiguation_between": ["DLH", "BLH"],
+      "clarify_prompt": "Did you mean Dr. Don Henslee or Dr. Brandon Henslee ?"
+    }
+  ]
+},
+  "rules": [
+    {
+      "id": "second_opinion",
+      "topic": "Second opinion",
+      "depts": ["front_desk", "phones", "triage"],
+      "logic": {
+        "constraints": [
+          {"type": "must_be_physician_visit", "value": true},
+          {"type": "no_double_book_adjacent_to_cancer_consult", "value": true}
+        ]
+      },
+      "routing": {"allowed_roles": ["MD"], "disallowed_roles": ["APP"]},
+      "notes": "Only schedule on physician. Do not double book before/after cancer consults."
+    },
+    {
+      "id": "ed_new_patient",
+      "topic": "Erectile Dysfunction (new patient)",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {
+        "allowed_providers": ["LAW","TPB","TMK","LWM"],
+        "disallowed_providers": ["DLH","AJL","AJP","JRH","DBW"]
+      },
+      "notes": "NP-ED with LAW/TPB/TMK/LWM; do not schedule ED-NP with DLH/AJL/AJP/JRH/DBW."
+    },
+    {
+      "id": "elevated_psa",
+      "topic": "Elevated PSA",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {
+        "allowed_roles": ["MD","APP"]
+      },
+      "logic": {
+        "fallback": {
+          "if_no_np_within_days": 7,
+          "then_double_book_role": "MD",
+          "requires_approval": false
+        }
+      },
+      "notes": "OK to double book MD if no NP within 7 days."
+    },
+    {
+      "id": "circumcision",
+      "topic": "Circumcision",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {
+        "pediatric_providers": ["Henslee","McGuffey"],
+        "adult_providers": "any"
+      },
+      "notes": "Peds → Henslee/McGuffey. Adults → any provider."
+    },
+    {
+      "id": "incontinence_general",
+      "topic": "Incontinence / LUTS (general)",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {"allowed_providers": "any", "disallowed_providers": ["DLH (women incontinence)"]},
+      "notes": "DLH does not want to see women incontinence."
+    },
+    {
+      "id": "urethral_diverticulum",
+      "topic": "Urethral diverticulum",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {"allowed_providers": ["TMK"], "clinic": "incontinence"},
+      "notes": "TMK only, incontinence clinic."
+    },
+    {
+      "id": "sacrocolpopexy",
+      "topic": "Sacrocolpopexy",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {"allowed_providers": ["TPB","TMK"]},
+      "notes": "TPB & TMK only."
+    },
+    {
+      "id": "low_testosterone",
+      "topic": "Low testosterone",
+      "depts": ["front_desk", "phones"],
+      "logic": {"time_of_day": {"before_hour": 10}},
+      "routing": {
+        "disallowed_pairs": [["TPB","KMW"],["AJL","HBS"],["DBW","TAW"],["DLH"]],
+        "notes_on_providers": {
+          "SCM": "No testosterone teaching on SCM schedule.",
+          "CTB": "Performs testosterone bead implants."
+        }
+      },
+      "notes": "Schedule before 10am; do not schedule with listed pairings; SCM no teaching; CTB bead implants."
+    },
+    {
+      "id": "pessary",
+      "topic": "Pessary",
+      "depts": ["front_desk", "phones"],
+      "logic": {"double_book_provider": "SCM"},
+      "routing": {"follow_up_providers": ["TMK","LBL","KMW","SCM"]},
+      "notes": "May double-book SCM for pessary; F/Us can be with TMK/LBL/KMW/SCM per schedule."
+    },
+    {
+      "id": "peyronies_xiaflex",
+      "topic": "Peyronie’s / Xiaflex",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {
+        "allowed_providers": ["LWM","CTB","TPB","LAW","TMK"],
+        "disallowed_providers": ["JRH","AJP","JLC","AJL","HBS","DBW","TAW","DLH","LBL","JGO","JDW","SCM","KMW"]
+      },
+      "notes": "Only the listed YES providers."
+    },
+    {
+      "id": "retention_voiding_trial",
+      "topic": "Urinary retention / Voiding trial",
+      "depts": ["front_desk", "triage"],
+      "logic": {
+        "double_book": false,
+        "slot_minutes": 30,
+        "min_days_since_catheter": 7,
+        "scheduler_order": ["Simone", "Primary urologist APP", "MD"]
+      },
+      "notes": "Do not double-book; 30m; catheter removal after 7–10 days."
+    },
+    {
+      "id": "pediatrics_general",
+      "topic": "Pediatrics (general)",
+      "depts": ["front_desk", "phones"],
+      "routing": {"allowed_providers": ["Henslee","McGuffey"], "exceptions": {"AJP": "emergent with prior approval"}},
+      "notes": "McGuffey peds focus: circumcisions, undescended testicles, hydrocele."
+    },
+    {
+      "id": "vasectomy",
+      "topic": "Vasectomy",
+      "depts": ["front_desk", "phones"],
+      "routing": {
+        "allowed": "any_provider_incl_APPs",
+        "disallowed": ["Kirkpatrick","Lillie Lueke","Simone Martin","Jake Creevan"],
+        "non_scalpel": ["LWM","TPB","LAW"],
+        "slot_types": ["vas consult","EP","NP"]
+      },
+      "notes": "Do not schedule with listed disallowed names; non-scalpel options listed."
+    },
+    {
+      "id": "vasectomy_reversal",
+      "topic": "Vasectomy reversal",
+      "depts": ["front_desk", "phones"],
+      "routing": {"allowed_providers": ["Brush","Pomajzl","McGuffey","Wiebusch","Wiltfong"], "roles": ["MD"]},
+      "notes": "MD only; specific surgeons."
+    },
+    {
+      "id": "renal_mass",
+      "topic": "Renal mass",
+      "depts": ["triage", "front_desk"],
+      "routing": {"allowed_roles": ["MD"], "disallowed_providers": ["DLH"]},
+      "notes": "MD only; do not schedule with DLH."
+    },
+    {
+      "id": "urothelial_thickening",
+      "topic": "Urothelial thickening",
+      "depts": ["triage", "front_desk"],
+      "routing": {"allowed_roles": ["MD"], "disallowed_roles": ["APP"]},
+      "notes": "MD only."
+    },
+    {
+      "id": "snm_interstim",
+      "topic": "SNM / InterStim clinic",
+      "depts": ["front_desk", "phones", "triage"],
+      "routing": {"disallowed_providers": ["DBW","TAW","DLH","JDW"], "clinic": "incontinence"},
+      "logic": {
+        "event_type": "SNM Education",
+        "calendar_description_fields": ["patient name", "DOB"]
+      },
+      "notes": "If TMK → book incontinence clinic. Use SNM Education event and add name/DOB."
+    }
+  ]
+}
