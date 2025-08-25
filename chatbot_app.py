@@ -149,6 +149,26 @@ def _init_catalog():
 
 _init_catalog()
 
+def _rules_db_path() -> str:
+    # RULES_DB can be overridden by env; default to rules.db next to this file
+    try:
+        return os.getenv("RULES_DB") or str(Path(__file__).with_name("rules.db"))
+    except Exception:
+        return "rules.db"
+
+def _fb_conn():
+    """
+    Feedback/settings/rules connection handle (rules.db).
+    Row factory returns sqlite3.Row for dict-like access.
+    """
+    path = _rules_db_path()
+    conn = sqlite3.connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        pass
+    return conn
+
 # Utility: Return visible file paths for a user from the catalog, respecting department ACL
 def _catalog_visible_files_for_user(username: str, limit: int = 200) -> List[str]:
     uobj = get_user(username) or {}
@@ -697,9 +717,7 @@ def home(request: Request):
 def _build_index_on_start():
     # 1) Build/refresh vector index from AI_REF_ROOT at startup (unchanged)
     try:
-        build_or_update_vector_index(
-            root=AI_REF_ROOT,
-            ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+        build_or_update_vector_index(ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
             embed_model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
         )
         logging.info("Vector index built at startup.")
@@ -716,6 +734,16 @@ def _build_index_on_start():
         reindex_all_xlsx_structure()
     except Exception as e:
         logging.error(f"Startup xlsx structure index failed: {e}")
+    # Ensure examples table (and other feedback tables) exist now that _fb_conn is ready
+    try:
+        _ensure_examples_table()
+    except Exception as e:
+        logging.warning(f"Examples table init failed: {e}")
+
+    try:
+        _ensure_research_tables()
+    except Exception as e:
+        logging.warning(f"Research tables init failed: {e}")
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
@@ -1259,9 +1287,9 @@ def api_search(q: str, k: int = 5, user: str = Depends(require_user)):
     hits = embed_search(
         query=q,
         k=k,
+        root=AI_REF_ROOT,
         ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
         embed_model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
-        root=AI_REF_ROOT,
     )
     # Optionally: restrict per-department paths as you already do
     uobj = get_user(user) or {}
@@ -1625,6 +1653,208 @@ def promote_frequent_phrases(min_hits: int = 3, max_new: int = 20):
         try: conn.close()
         except: pass
 
+# ---- Auto-Research (deep local corpus scan) ----
+def _ensure_research_tables():
+    conn = _fb_conn()
+    if not conn:
+        return
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS research_tasks(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              created_by TEXT,
+              query TEXT NOT NULL,
+              status TEXT DEFAULT 'queued',     -- queued|running|done|error
+              params TEXT,                      -- JSON: dept scope, limits
+              last_error TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS research_findings(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              task_id INTEGER,
+              found_at TEXT NOT NULL DEFAULT (datetime('now')),
+              source_path TEXT,
+              sheet TEXT,
+              cell TEXT,
+              snippet TEXT,
+              score REAL,
+              kind TEXT,                        -- files|xlsx_cells|bm25|vector
+              FOREIGN KEY(task_id) REFERENCES research_tasks(id)
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        try: conn.close()
+        except: pass
+
+_ensure_research_tables()
+
+def _cat_like_rows(q: str, allowed_rel_paths: list[str], limit: int = 50) -> list[dict]:
+    """LIKE scan over ai_ref.db:files(text_preview) within allowed paths."""
+    conn = _catdb(); cur = conn.cursor()
+    try:
+        if not allowed_rel_paths:
+            return []
+        placeholders = ",".join("?"*len(allowed_rel_paths))
+        qlike = f"%{(q or '').strip().lower()}%"
+        rows = cur.execute(
+            f"""
+            SELECT path, text_preview AS snippet
+            FROM files
+            WHERE (LOWER(text_preview) LIKE ? OR LOWER(path) LIKE ?)
+              AND path IN ({placeholders})
+            ORDER BY LENGTH(text_preview) ASC
+            LIMIT ?
+            """,
+            (qlike, qlike, *allowed_rel_paths, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def _xlsx_cell_like_rows(q: str, allowed_rel_paths: list[str], limit: int = 50) -> list[dict]:
+    """LIKE scan over ai_ref.db:xlsx_cells(text) within allowed paths."""
+    conn = _catdb(); cur = conn.cursor()
+    try:
+        if not allowed_rel_paths:
+            return []
+        placeholders = ",".join("?"*len(allowed_rel_paths))
+        qlike = f"%{(q or '').strip().lower()}%"
+        rows = cur.execute(
+            f"""
+            SELECT path, sheet, cell, text AS snippet, 0.75 AS score
+            FROM xlsx_cells
+            WHERE LOWER(text) LIKE ?
+              AND path IN ({placeholders})
+            ORDER BY LENGTH(text) ASC
+            LIMIT ?
+            """,
+            (qlike, *allowed_rel_paths, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def auto_research(query: str, allowed_abs_paths: list[str], *, limit_per_source: int = 40) -> list[dict]:
+    """
+    Deep local scan to supplement weak/no hits. Returns a list of findings dicts:
+      {source_path, sheet, cell, snippet, score, kind}
+    """
+    # Build allowed relative paths for ai_ref.db joins
+    allowed_rel: list[str] = []
+    for a in allowed_abs_paths:
+        try:
+            rel = str(Path(a).resolve().relative_to(Path(AI_REF_ROOT).resolve()))
+            allowed_rel.append(rel)
+        except Exception:
+            if str(a).startswith(str(AI_REF_ROOT)):
+                allowed_rel.append(str(a).replace(str(AI_REF_ROOT)+"/", ""))
+    findings: list[dict] = []
+
+    # 1) LIKE over catalog files.text_preview
+    try:
+        for r in _cat_like_rows(query, allowed_rel, limit=limit_per_source):
+            findings.append({
+                "source_path": r.get("path"),
+                "sheet": None,
+                "cell": None,
+                "snippet": (r.get("snippet") or "")[:500],
+                "score": 0.6,
+                "kind": "files"
+            })
+    except Exception as e:
+        logging.warning(f"auto_research files LIKE failed: {e}")
+
+    # 2) xlsx_cells LIKE
+    try:
+        for r in _xlsx_cell_like_rows(query, allowed_rel, limit=limit_per_source):
+            findings.append({
+                "source_path": r.get("path"),
+                "sheet": r.get("sheet"),
+                "cell": r.get("cell"),
+                "snippet": (r.get("snippet") or "")[:500],
+                "score": float(r.get("score") or 0.75),
+                "kind": "xlsx_cells"
+            })
+    except Exception as e:
+        logging.warning(f"auto_research xlsx_cells failed: {e}")
+
+    # 3) BM25 (if available) with a deeper K
+    try:
+        bm = simple_search(query, k=40, )
+        allowed_set = set(allowed_abs_paths)
+        for h in bm:
+            p = str(h.get('path',''))
+            if not p:
+                continue
+            if p in allowed_set or any(str(p).endswith(Path(a).name) for a in allowed_abs_paths):
+                findings.append({
+                    "source_path": p,
+                    "sheet": None,
+                    "cell": None,
+                    "snippet": (h.get('text_preview') or '')[:500],
+                    "score": float(h.get('score') or 0.65),
+                    "kind": "bm25"
+                })
+    except Exception as e:
+        logging.warning(f"auto_research bm25 failed: {e}")
+
+    # 4) Vector search (deeper K)
+    try:
+        vec = embed_search(
+            query,
+            k=40,
+            root=AI_REF_ROOT,
+            ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+            embed_model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
+        )
+        allowed_set = set(allowed_abs_paths)
+        for h in vec:
+            p = str(h.get('path',''))
+            if not p:
+                continue
+            if p in allowed_set or any(str(p).endswith(Path(a).name) for a in allowed_abs_paths):
+                findings.append({
+                    "source_path": p,
+                    "sheet": None,
+                    "cell": None,
+                    "snippet": (h.get('text_preview') or '')[:500],
+                    "score": float(h.get('score') or 0.7),
+                    "kind": "vector"
+                })
+    except Exception as e:
+        logging.warning(f"auto_research vector failed: {e}")
+
+    # Deduplicate & rank
+    seen = set()
+    uniq: list[dict] = []
+    for f in findings:
+        key = (f.get('source_path'), f.get('sheet'), f.get('cell'), f.get('snippet'))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(f)
+    uniq.sort(key=lambda x: (-(x.get('score') or 0.0), len(x.get('snippet') or '')))
+    return uniq[: max(10, limit_per_source)]
+
+def format_research_block(findings: list[dict]) -> str:
+    if not findings:
+        return ""
+    lines = ["Auto Research Findings"]
+    for f in findings[:12]:
+        loc = Path(f.get('source_path','')).name
+        if f.get('sheet') and f.get('cell'):
+            loc += f" / {f['sheet']} / {f['cell']}"
+        snip = (f.get('snippet') or '').replace('\n', ' ')[:220]
+        lines.append(f"• {loc} [{f.get('kind')}] — \"{snip}\"")
+    return "\n".join(lines)
+
 def _ensure_feedback_table():
     conn = _fb_conn()
     if not conn:
@@ -1937,12 +2167,11 @@ def chat(req: ChatRequest, user: str = Depends(require_user)):
     vec_hits = embed_search(
         query=query_text,
         k=max(req.k, 8),
+        root=AI_REF_ROOT,
         ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
         embed_model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
-        root=AI_REF_ROOT,
     )
-    bm_hits = simple_search(query_text, k=max(req.k, 12), root=AI_REF_ROOT) if os.getenv("HYBRID_SEARCH",
-                                                                                         "1") == "1" else []
+    bm_hits = simple_search(query_text, k=max(req.k, 12)) if os.getenv("HYBRID_SEARCH","1") == "1" else []
 
     # Filter by ACL
     uobj = get_user(user) or {}
@@ -1971,6 +2200,22 @@ def chat(req: ChatRequest, user: str = Depends(require_user)):
 
     # Decision logging (does not alter flow yet)
     best_file_score = max((h.get('score', 0.0) for h in hits), default=0.0) if hits else 0.0
+    # If evidence is weak, run auto-research to look deeper in the local corpus
+    auto_block = ""
+    try:
+        thr = float(os.getenv("AUTORESEARCH_THRESHOLD", "0.58"))
+        if (not has_any_hits) or best_file_score < thr:
+            uobj_ar = get_user(user) or {}
+            allowed_ar = ref_paths_for_user(uobj_ar.get("department"))
+            ar_findings = auto_research(query_text, allowed_ar, limit_per_source=24)
+            auto_block = format_research_block(ar_findings)
+            if auto_block:
+                try:
+                    log_reasoning(req.session_id, 'research', auto_block[:500])
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.warning(f"auto_research failed in /chat: {e}")
     need_disamb = False  # set True when provider ambiguity is detected elsewhere
     choice, conf = decide_action(has_db_hits, bool(hits), best_file_score, need_disamb)
     try:
@@ -2014,6 +2259,9 @@ def chat(req: ChatRequest, user: str = Depends(require_user)):
 
         if provider_context_block:
             sections.append(provider_context_block)
+
+        if auto_block:
+            sections.append(auto_block)
 
         if structured_block:
             sections.append(structured_block)
@@ -2112,6 +2360,8 @@ def chat(req: ChatRequest, user: str = Depends(require_user)):
     ]
     context = "\n".join(base_ctx_rows)
     blocks = []
+    if auto_block:
+        blocks.append(auto_block)
     if provider_context_block:
         blocks.append(f"Provider Context\n{provider_context_block}")
     if db_context_block:
@@ -2411,6 +2661,60 @@ def admin_set_role_api(target: str = Form(...), role: str = Form(...), admin: st
 def admin_learn_promote(admin: str = Depends(require_admin)):
     n = promote_frequent_phrases()
     return {"ok": True, "promoted": n}
+
+@app.post("/admin/research/queue")
+def admin_research_queue(query: str = Body(...), params: dict | None = Body(None), admin: str = Depends(require_admin)):
+    conn = _fb_conn()
+    if not conn:
+        raise HTTPException(500, "rules.db unavailable")
+    try:
+        conn.execute("INSERT INTO research_tasks(created_by, query, params) VALUES(?,?,?)",
+                     (canon_username(admin), query, json.dumps(params or {})))
+        conn.commit()
+        tid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    finally:
+        conn.close()
+    return {"ok": True, "task_id": tid}
+
+@app.post("/admin/research/run")
+def admin_research_run(task_id: Optional[int] = Body(None), admin: str = Depends(require_admin)):
+    # Fetch one or a specific task
+    conn = _fb_conn()
+    if not conn:
+        raise HTTPException(500, "rules.db unavailable")
+    try:
+        if task_id:
+            row = conn.execute("SELECT id, query, params FROM research_tasks WHERE id=?", (task_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT id, query, params FROM research_tasks WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+        if not row:
+            return {"ok": True, "ran": 0, "findings": []}
+        tid, q, pjson = row
+        conn.execute("UPDATE research_tasks SET status='running' WHERE id=?", (tid,)); conn.commit()
+    finally:
+        conn.close()
+
+    # Compute allowed paths for the admin's dept
+    uobj = get_user(admin) or {}
+    allowed = ref_paths_for_user(uobj.get("department"))
+    findings = auto_research(q, allowed, limit_per_source=40)
+
+    # Store findings
+    conn = _fb_conn()
+    try:
+        for f in findings:
+            conn.execute(
+                "INSERT INTO research_findings(task_id, source_path, sheet, cell, snippet, score, kind) VALUES(?,?,?,?,?,?,?)",
+                (tid, f.get('source_path'), f.get('sheet'), f.get('cell'), f.get('snippet'), f.get('score'), f.get('kind'))
+            )
+        conn.execute("UPDATE research_tasks SET status='done' WHERE id=?", (tid,))
+        conn.commit()
+    except Exception as e:
+        conn.execute("UPDATE research_tasks SET status='error', last_error=? WHERE id=?", (str(e), tid))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "ran": 1, "task_id": tid, "findings": findings[:12]}
 
 @app.get("/admin/logs", response_class=HTMLResponse)
 def admin_logs(request: Request, user: Optional[str] = None, admin: str = Depends(require_admin)):

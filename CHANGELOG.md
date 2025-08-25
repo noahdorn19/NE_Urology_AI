@@ -1,64 +1,43 @@
-# NE_Urology_AI — Release Notes
+## Version 0.18.2 — 2025-08-24
 
-## Version 0.18.1 — 2025-08-23
-
-This release adds major improvements to grounding, synonym learning, and reflexive AI answering.
+⚠️ Status: Prototype/Testing Only  
+This version is **not yet production ready**. It remains in the testing phase. Version 1.0.0 is still planned as the first stable release.
 
 ### 🚀 New Features
-- **Two-pass autoregressive self-check (`_generate_with_self_check`)**
-  - AI now generates a draft, then reviews its own output for hallucinations, grounding violations, and contradictions.
-  - Enforces context-only answers, with concise corrections and clarifying questions if uncertain.
-
-- **Synonym learning & confirmation loop**
-  - Added `synonym_map` table in `rules.db` with support for:
-    - Confidence scoring, weight, last_used, and feedback learning.
-  - New `expand_with_synonyms()` function augments user queries with canonical terms for better DB/file matching.
-  - AI can now propose synonym mappings:
-    - User confirms with **yes** → stored as a learned synonym.
-    - User corrects with **“no, I meant …”** → updates synonym map accordingly.
-  - Added `/feedback` endpoint for structured feedback (observed, canonical, rating, comment).
-
-- **Database context integration**
-  - `load_rule_matches()` searches `scheduling_rules` in `rules.db` (topic, description, OCR text).
-  - `load_related_rules()` provides fuzzy/related rule matches when no exact match is found.
-  - Rules from DB are treated as **authoritative over file OCR** when both are present.
-
-- **Provider context lookup**
-  - Provider abbreviations (e.g., TPB, DLH, BLH) resolved via `providers.db`.
-  - AI now injects “Provider Context” blocks automatically when providers are detected in user messages.
-
-- **Image integration**
-  - New endpoints:
-    - `/api/xlsx_image_raw` → return embedded `.xlsx` image bytes.
-    - `/view/xlsx_images` → render sheet-level HTML galleries of workbook images.
-  - Chat responses automatically prepend relevant images from **Scheduling Decision Tree.xlsx** or the hit `.xlsx`.
-
-- **Startup refresh**
-  - On `startup`, `refresh_rules_from_ai_ref()` runs:
-    - Imports OCR previews from `ai_ref.db` into `rules.db`.
-    - Keeps `scheduling_rules` in sync with the latest ingested content.
-
-- **System profiles (modular prompts)**
-  - Three selectable styles: `strict_rag`, `guided_grounded` (default), `general`.
-  - Runtime switching via `/admin/system_profile` with `X-Admin-Token`.
-  - Profiles adjust how AI handles hits, grounding, and clarification questions.
+- **Self-research fallback**  
+  Added an “auto research” layer where the AI digs deeper into OCR/Excel/DB content if direct matches aren’t found.
+- **Expanded synonym learning**  
+  - Synonym map now supports auto-expansion of user queries (“unable to urinate” → “urinary retention”).  
+  - Confirmation prompts added so users can correct or approve synonyms mid-conversation.
+- **Rule DB integration upgrades**  
+  - Scheduling rules from OCR/EMF scans are now synced into `rules.db`, not just JSON.  
+  - Added ability to include OCR/EMF text alongside structured scheduling rules.
+- **Context block assembly improvements**  
+  - Responses now include **cumulative context**: DB context + provider context + file hits, instead of either/or.  
+  - “Possibly related” section appears when no strong match is found.
+- **Provider disambiguation**  
+  - AI now asks clarifying questions (e.g., “Dr. Don Henslee or Dr. Brandon Henslee?”) when abbreviations are ambiguous.
+- **Image integration in chat**  
+  - Relevant Excel `.emf`/image previews are shown inline with AI’s textual reasoning.  
+  - Sheet-level image galleries available at `/view/xlsx_images`.
+- **Feedback loop groundwork**  
+  - `/feedback` endpoint extended to allow user corrections to be stored and improve synonym mappings/rule alignment.
+- **Startup sync updates**  
+  - Improved `refresh_rules_from_ai_ref()` and index rebuilds so rules/images/embeddings always sync at app boot.
 
 ### 🛠 Improvements
-- **Chat flow** now checks **DB context → Provider context → File hits** in order of authority.
-- Introduced **“Possibly related”** section when no direct match is found.
-- Config JSON mentions (`scheduling_rules.json`) are sanitized into human-readable source names.
-- Session-specific synonym confirmation handled via `PENDING_SYNONYM`.
-- Structured context block assembly ensures cumulative inclusion of DB, provider, and file matches.
+- Removed all reliance on `scheduling_rules.json`; rules now come **only from `rules.db`**.  
+- AI responses are rephrased to address staff directly (first person), rather than describing actions in third person.  
+- AI now gracefully handles “close but not exact” matches — tries synonyms, related rules, or research before giving up.  
+- Stability fixes for crashes caused by wrong `simple_search` arguments and missing `structured_block`.
 
 ### 🐛 Fixes
-- Fixed incorrect SQL parameter binding in `load_related_rules()`.
-- Ensured catalog ignores unchanged files unless forced.
-- Startup no longer fails when `scheduling_rules` table missing — auto-creates if absent.
-- Improved ACL checks for `.xlsx` images to respect user department restrictions.
+- Fixed indentation errors in `chatbot_app.py`.  
+- Corrected SQL binding issues in `load_related_rules()`.  
+- Removed invalid `root=AI_REF_ROOT` calls in `simple_search`.  
+- Added missing safety checks so the app won’t crash if OCR/structured fields aren’t populated.
 
 ---
 
 🔖 **Summary:**  
-Version 0.18.1 introduces **self-refining AI answers, synonym learning, and multi-source grounding (DB + providers + OCR)**, making the assistant significantly more accurate and adaptive for schedulers and staff.
-
-This version is not yet production ready and remains in prototype/testing phase. Version 1.0.0 is planned as the first stable release.
+Version 0.18.2 makes the AI **smarter, more resilient, and more user-friendly** by introducing synonym learning, auto-research, inline images, and stronger DB grounding. It is still in **prototype phase** and not production-ready.
